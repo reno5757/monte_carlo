@@ -1302,8 +1302,8 @@ export default function Home() {
                             setBuckets(next);
                           }}
                         >
-                          <option value="uniform">Uniform</option>
-                          <option value="point">Point</option>
+                          <option value="uniform">Range</option>
+                          <option value="point">Fixed</option>
                         </select>
                       </div>
                       <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
