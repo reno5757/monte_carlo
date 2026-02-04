@@ -137,7 +137,7 @@ const defaultBuckets: Bucket[] = [
     p: 0.15,
     type: "uniform",
     lo: -0.5,
-    hi: 0,
+    hi: 0.5,
   },
   {
     id: "small_win",
