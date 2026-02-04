@@ -125,7 +125,7 @@ const defaultBuckets: Bucket[] = [
   { id: "hard_loss", name: "Hard loss", p: 0.49, type: "point", v: -1 },
   {
     id: "norm_loss",
-    name: "Normal loss",
+    name: "Smaller loss",
     p: 0.1,
     type: "uniform",
     lo: -0.9,
