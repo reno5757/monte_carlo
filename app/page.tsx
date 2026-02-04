@@ -1308,7 +1308,7 @@ export default function Home() {
                       </div>
                       <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
                         <label className="flex flex-col gap-1">
-                          p
+                          Prob
                         <div className="relative">
                           <input
                             className="w-full rounded-lg border border-black/10 bg-transparent py-1 pl-2 pr-6"
@@ -1329,7 +1329,7 @@ export default function Home() {
                         {bucket.type === "uniform" ? (
                           <>
                             <label className="flex flex-col gap-1">
-                              lo
+                              Min R
                               <input
                                 className="rounded-lg border border-black/10 bg-transparent px-2 py-1"
                                 type="number"
@@ -1343,7 +1343,7 @@ export default function Home() {
                               />
                             </label>
                             <label className="flex flex-col gap-1">
-                              hi
+                              Max R
                               <input
                                 className="rounded-lg border border-black/10 bg-transparent px-2 py-1"
                                 type="number"
@@ -1359,7 +1359,7 @@ export default function Home() {
                           </>
                         ) : (
                           <label className="flex flex-col gap-1">
-                            v
+                            R
                             <input
                               className="rounded-lg border border-black/10 bg-transparent px-2 py-1"
                               type="number"
