@@ -1185,7 +1185,7 @@ export default function Home() {
                     />
                   </label>
                   <label className="flex flex-col gap-2 text-sm font-medium">
-                    Risk 
+                    Risk Per Trade
                     <div className="relative">
                       <input
                         className="w-full rounded-xl border border-black/10 bg-transparent py-2 pl-3 pr-8 text-base"
