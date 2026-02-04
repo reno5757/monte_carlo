@@ -585,6 +585,7 @@ function MonthlyTableView({ title, rows }: { title: string; rows: MonthlyStatsRo
     rows.length === 0
       ? 0
       : rows.reduce((acc, row) => acc * (1 + row.returnValue), 1) - 1;
+  const enableScroll = rows.length > 15;
 
   const cellStyle = (value: number) => {
     if (value >= 0.1) return "bg-emerald-500/20 text-emerald-200";
@@ -608,7 +609,9 @@ function MonthlyTableView({ title, rows }: { title: string; rows: MonthlyStatsRo
           Monthly Returns
         </span>
       </div>
-      <div className="overflow-x-auto">
+      <div
+        className={`overflow-x-auto ${enableScroll ? "max-h-[560px] overflow-y-auto pr-1" : ""}`}
+      >
         <table className="min-w-[520px] table-fixed text-sm">
           <thead className="text-center text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
             <tr>
