@@ -4,12 +4,12 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Bar,
   Line,
-  Scatter,
 } from "react-chartjs-2";
 import {
   BarElement,
   CategoryScale,
   Chart as ChartJS,
+  type ChartDataset,
   LinearScale,
   LineElement,
   PointElement,
@@ -104,8 +104,8 @@ type SimulationResult = {
   };
   monthlyTables: {
     median: MonthlyStatsRow[];
-    best: MonthlyStatsRow[];
-    worst: MonthlyStatsRow[];
+    p5: MonthlyStatsRow[];
+    p95: MonthlyStatsRow[];
   };
   histograms: {
     drawdown: Histogram;
@@ -473,12 +473,18 @@ function runSimulation({
   const mcl95 = percentile(maxConsecutiveLossesAll, 95);
 
   const medianValue = final50;
+  const p5Value = final5;
+  const p95Value = final95;
   let medianIdx = 0;
+  let p5Idx = 0;
+  let p95Idx = 0;
   let bestIdx = 0;
   let worstIdx = 0;
   let bestValue = Number.NEGATIVE_INFINITY;
   let worstValue = Number.POSITIVE_INFINITY;
   let closest = Number.POSITIVE_INFINITY;
+  let closestP5 = Number.POSITIVE_INFINITY;
+  let closestP95 = Number.POSITIVE_INFINITY;
 
   for (let i = 0; i < finalEquity.length; i += 1) {
     const value = finalEquity[i];
@@ -494,6 +500,16 @@ function runSimulation({
     if (distance < closest) {
       closest = distance;
       medianIdx = i;
+    }
+    const distanceP5 = Math.abs(value - p5Value);
+    if (distanceP5 < closestP5) {
+      closestP5 = distanceP5;
+      p5Idx = i;
+    }
+    const distanceP95 = Math.abs(value - p95Value);
+    if (distanceP95 < closestP95) {
+      closestP95 = distanceP95;
+      p95Idx = i;
     }
   }
 
@@ -518,17 +534,17 @@ function runSimulation({
       startYear,
       startMonth
     ),
-    best: monthlyStatsFromPath(
-      equityPaths[bestIdx],
-      rPaths[bestIdx],
+    p5: monthlyStatsFromPath(
+      equityPaths[p5Idx],
+      rPaths[p5Idx],
       startEquity,
       tradesPerMonth,
       startYear,
       startMonth
     ),
-    worst: monthlyStatsFromPath(
-      equityPaths[worstIdx],
-      rPaths[worstIdx],
+    p95: monthlyStatsFromPath(
+      equityPaths[p95Idx],
+      rPaths[p95Idx],
       startEquity,
       tradesPerMonth,
       startYear,
@@ -565,6 +581,11 @@ function parseNumber(value: string) {
 }
 
 function MonthlyTableView({ title, rows }: { title: string; rows: MonthlyStatsRow[] }) {
+  const totalReturn =
+    rows.length === 0
+      ? 0
+      : rows.reduce((acc, row) => acc * (1 + row.returnValue), 1) - 1;
+
   const cellStyle = (value: number) => {
     if (value >= 0.1) return "bg-emerald-500/20 text-emerald-200";
     if (value >= 0.03) return "bg-emerald-500/10 text-emerald-100";
@@ -577,7 +598,12 @@ function MonthlyTableView({ title, rows }: { title: string; rows: MonthlyStatsRo
   return (
     <div className="panel rounded-2xl border border-black/5 p-4 shadow-lg shadow-black/5">
       <div className="mb-3 flex items-center justify-between">
-        <h3 className="text-lg font-semibold text-[color:var(--panel-ink)]">{title}</h3>
+        <div className="flex flex-col">
+          <h3 className="text-lg font-semibold text-[color:var(--panel-ink)]">{title}</h3>
+          <span className="text-xs text-[color:var(--muted)]">
+            Total return: {percentFormatter.format(totalReturn)}
+          </span>
+        </div>
         <span className="mono text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
           Monthly Returns
         </span>
@@ -781,7 +807,7 @@ export default function Home() {
       "#a855f7",
     ];
 
-    const datasets = percentiles.map((p, pIdx) => {
+    const datasets: ChartDataset<"line", number[]>[] = percentiles.map((p, pIdx) => {
       const target = percentile(results.finalEquity, p);
       let closestIdx = 0;
       let closest = Number.POSITIVE_INFINITY;
@@ -806,14 +832,34 @@ export default function Home() {
       };
     });
 
+    datasets.push({
+      label: "Worst path",
+      data: Array.from(results.equityPaths[results.worstIdx]),
+      borderColor: "#ef4444",
+      borderWidth: 2.5,
+      pointRadius: 0,
+      tension: 0.2,
+      borderDash: [6, 4],
+    });
+
+    datasets.push({
+      label: "Starting equity",
+      data: new Array(tradeCount).fill(startEquity),
+      borderColor: "rgba(148, 163, 184, 0.9)",
+      borderWidth: 1.8,
+      pointRadius: 0,
+      tension: 0,
+      borderDash: [4, 4],
+    });
+
     return { labels: tradeLabels, datasets };
-  }, [results, tradeLabels]);
+  }, [results, tradeLabels, startEquity]);
 
   const percentilePathMetrics = useMemo(() => {
     if (!results) return null;
     const percentiles = [10, 20, 30, 40, 50, 60, 70, 80, 90];
     const tradesPerYear = Math.max(1, Math.trunc(tradesPerMonth)) * 12;
-    return percentiles.map((p) => {
+    const metrics = percentiles.map((p) => {
       const target = percentile(results.finalEquity, p);
       let closestIdx = 0;
       let closest = Number.POSITIVE_INFINITY;
@@ -848,7 +894,7 @@ export default function Home() {
       const calmar = dd === 0 ? 0 : annualizedReturn / Math.abs(dd);
 
       return {
-        percentile: p,
+        label: `${p}th`,
         totalReturn: annualizedReturn,
         sharpe,
         calmar,
@@ -856,6 +902,35 @@ export default function Home() {
         stdDev: stdDev * Math.sqrt(tradesPerYear),
       };
     });
+    const worstPath = results.equityPaths[results.worstIdx];
+    const worstTotalReturn = worstPath[worstPath.length - 1] / startEquity - 1;
+    const nTrades = worstPath.length;
+    const annualizedReturn =
+      nTrades === 0 ? 0 : Math.pow(1 + worstTotalReturn, tradesPerYear / nTrades) - 1;
+    const worstTradeReturns: number[] = new Array(nTrades);
+    for (let i = 0; i < nTrades; i += 1) {
+      const prev = i === 0 ? startEquity : worstPath[i - 1];
+      worstTradeReturns[i] = prev === 0 ? 0 : worstPath[i] / prev - 1;
+    }
+    const meanReturn =
+      worstTradeReturns.reduce((acc, v) => acc + v, 0) / Math.max(1, nTrades);
+    const variance =
+      worstTradeReturns.reduce((acc, v) => acc + (v - meanReturn) ** 2, 0) /
+      Math.max(1, nTrades - 1);
+    const stdDev = Math.sqrt(variance);
+    const sharpe = stdDev === 0 ? 0 : (meanReturn / stdDev) * Math.sqrt(tradesPerYear);
+    const dd = maxDrawdown(worstPath);
+    const calmar = dd === 0 ? 0 : annualizedReturn / Math.abs(dd);
+
+    const worstMetric = {
+      label: "Worst",
+      totalReturn: annualizedReturn,
+      sharpe,
+      calmar,
+      maxDrawdown: dd,
+      stdDev: stdDev * Math.sqrt(tradesPerYear),
+    };
+    return [worstMetric, ...metrics];
   }, [results, startEquity, tradesPerMonth]);
 
   const drawdownData = useMemo(() => {
@@ -941,6 +1016,7 @@ export default function Home() {
       totalPaths
     );
     const rPath = results.rPaths[clampedIndex - 1];
+    const equityPath = results.equityPaths[clampedIndex - 1];
     if (!rPath) return null;
     const colors = Array.from(rPath).map((y) => {
       if (y <= -0.5) return "rgba(239, 68, 68, 0.85)";
@@ -957,7 +1033,21 @@ export default function Home() {
           pointHoverRadius: 4,
           borderColor: "rgba(37, 99, 235, 0.25)",
           backgroundColor: colors,
+          yAxisID: "yR",
           showLine: false,
+        },
+        {
+          label: `Equity ${clampedIndex}`,
+          type: "line" as const,
+          data: Array.from(equityPath).map((e, i) => ({ x: i + 1, y: e })),
+          borderColor: "rgba(168, 85, 247, 0.95)",
+          backgroundColor: "rgba(168, 85, 247, 0.95)",
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 0,
+          yAxisID: "yEquity",
+          showLine: true,
+          tension: 0.12,
         },
       ],
     };
@@ -1072,7 +1162,9 @@ export default function Home() {
             color: "#9ca3af",
           },
         },
-        y: {
+        yR: {
+          type: "linear" as const,
+          position: "left" as const,
           grid: {
             color: "rgba(0,0,0,0.05)",
           },
@@ -1082,6 +1174,21 @@ export default function Home() {
           title: {
             display: true,
             text: "R multiple",
+            color: "#9ca3af",
+          },
+        },
+        yEquity: {
+          type: "linear" as const,
+          position: "right" as const,
+          grid: {
+            drawOnChartArea: false,
+          },
+          ticks: {
+            color: "#9ca3af",
+          },
+          title: {
+            display: true,
+            text: "Equity",
             color: "#9ca3af",
           },
         },
@@ -1488,7 +1595,7 @@ export default function Home() {
 
               {results ? (
                 <div className="mt-6 grid gap-4 md:grid-cols-5">
-                  <div className="rounded-2xl border border-black/5 p-4">
+                  <div className="rounded-2xl border border-black/5 p-4 md:col-span-2">
                     <div className="flex items-center justify-between gap-2">
                       <p className="text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
                         Trade Results
@@ -1505,8 +1612,8 @@ export default function Home() {
                         />
                       </label>
                     </div>
-                    <div className="mt-3 h-[200px] w-full rounded-2xl border border-black/5">
-                      {tradeResultsData ? <Scatter data={tradeResultsData} options={scatterOptions} /> : null}
+                    <div className="mt-3 h-[220px] w-full rounded-2xl border border-black/5">
+                      {tradeResultsData ? <Line data={tradeResultsData} options={scatterOptions} /> : null}
                     </div>
                   </div>
                   <div className="rounded-2xl border border-black/5 p-4">
@@ -1532,17 +1639,17 @@ export default function Home() {
                     <p className="text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
                       Final Equity 
                     </p>
-                    <div className="mt-3 grid gap-2 text-sm font-semibold">
+                    <div className="mt-3 grid gap-2 text-xs font-semibold">
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">5th percentile</span>
+                        <span className="text-[color:var(--muted)]">95% chance</span>
                         <span>{currencyFormatter.format(results.stats.final5)}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">50th percentile</span>
+                        <span className="text-[color:var(--muted)]">50% chance</span>
                         <span>{currencyFormatter.format(results.stats.final50)}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">95th percentile</span>
+                        <span className="text-[color:var(--muted)]">5% chance</span>
                         <span>{currencyFormatter.format(results.stats.final95)}</span>
                       </div>
                     </div>
@@ -1557,38 +1664,32 @@ export default function Home() {
                   </div>
                   <div className="rounded-2xl border border-black/5 p-4">
                     <p className="text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
-                      Max Drawdown 
+                      Max Drawdown & Max Consecutive Losses
                     </p>
-                    <div className="mt-3 grid gap-2 text-sm font-semibold">
+                    <div className="mt-3 grid gap-3 text-xs font-semibold">
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">5th percentile</span>
+                        <span className="text-[color:var(--muted)]">Max drawdown 95% chance</span>
                         <span>{percentFormatter.format(results.stats.dd5)}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">50th percentile</span>
+                        <span className="text-[color:var(--muted)]">Max drawdown 50% chance</span>
                         <span>{percentFormatter.format(results.stats.dd50)}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">95th percentile</span>
+                        <span className="text-[color:var(--muted)]">Max drawdown 5% chance</span>
                         <span>{percentFormatter.format(results.stats.dd95)}</span>
                       </div>
-                    </div>
-                  </div>
-                  <div className="rounded-2xl border border-black/5 p-4">
-                    <p className="text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
-                      Max Consecutive Losses
-                    </p>
-                    <div className="mt-3 grid gap-2 text-sm font-semibold">
+                      <div className="my-1 border-t border-black/5" />
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">5th percentile</span>
+                        <span className="text-[color:var(--muted)]">Consecutive losses 95% chance</span>
                         <span>{numberFormatter.format(results.stats.mcl5)}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">50th percentile</span>
+                        <span className="text-[color:var(--muted)]">Consecutive losses 50% chance</span>
                         <span>{numberFormatter.format(results.stats.mcl50)}</span>
                       </div>
                       <div className="flex items-center justify-between">
-                        <span className="text-[color:var(--muted)]">95th percentile</span>
+                        <span className="text-[color:var(--muted)]">Consecutive losses 5% chance</span>
                         <span>{numberFormatter.format(results.stats.mcl95)}</span>
                       </div>
                     </div>
@@ -1632,9 +1733,9 @@ export default function Home() {
                     </thead>
                     <tbody>
                       {percentilePathMetrics.map((metric) => (
-                        <tr key={metric.percentile}>
+                        <tr key={metric.label}>
                           <td className="border border-white/20 px-2 py-2 text-center font-semibold">
-                            {metric.percentile}th
+                            {metric.label}
                           </td>
                           <td className="border border-white/20 px-2 py-2 text-center">
                             {percentFormatter.format(metric.totalReturn)}
@@ -1667,8 +1768,8 @@ export default function Home() {
             {results && (
               <div className="grid gap-6 lg:grid-cols-3">
                 <MonthlyTableView title="Median Path" rows={results.monthlyTables.median} />
-                <MonthlyTableView title="Best Path" rows={results.monthlyTables.best} />
-                <MonthlyTableView title="Worst Path" rows={results.monthlyTables.worst} />
+                <MonthlyTableView title="95% Chance Path" rows={results.monthlyTables.p5} />
+                <MonthlyTableView title="5% Chance Path" rows={results.monthlyTables.p95} />
               </div>
             )}
 
