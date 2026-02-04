@@ -134,7 +134,7 @@ const defaultBuckets: Bucket[] = [
   {
     id: "scratch",
     name: "Scratch",
-    p: 0.1,
+    p: 0.15,
     type: "uniform",
     lo: -0.5,
     hi: 0,
@@ -142,9 +142,9 @@ const defaultBuckets: Bucket[] = [
   {
     id: "small_win",
     name: "Small win",
-    p: 0.28,
+    p: 0.23,
     type: "uniform",
-    lo: 0.1,
+    lo: 0.5,
     hi: 3,
   },
   {
