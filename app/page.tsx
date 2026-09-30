@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   Line,
@@ -10,12 +10,24 @@ import {
   CategoryScale,
   Chart as ChartJS,
   type ChartDataset,
+  Decimation,
   LinearScale,
   LineElement,
   PointElement,
   Tooltip,
   Legend,
 } from "chart.js";
+import {
+  type Bucket,
+  type BucketType,
+  type MonthlyStatsRow,
+  type OutcomeUnit,
+  type PathMetrics,
+  type SimulationInput,
+  type SimulationResult,
+  createSimContext,
+  simulatePath,
+} from "../lib/simulation";
 
 ChartJS.register(
   CategoryScale,
@@ -23,6 +35,7 @@ ChartJS.register(
   PointElement,
   LineElement,
   BarElement,
+  Decimation,
   Tooltip,
   Legend
 );
@@ -42,76 +55,7 @@ const monthNames = [
   "Dec",
 ];
 
-type BucketType = "uniform" | "point";
-
-type Bucket = {
-  id: string;
-  name: string;
-  p: number;
-  type: BucketType;
-  lo?: number;
-  hi?: number;
-  v?: number;
-};
-
-type Histogram = {
-  bins: number[];
-  counts: number[];
-  min: number;
-  max: number;
-};
-
-type MonthlyStatsRow = {
-  year: number;
-  month: number;
-  returnValue: number;
-  maxDrawdown: number;
-  winRate: number;
-  maxConsecutiveLosses: number;
-  endEquity: number;
-};
-
-type SimulationResult = {
-  equityPaths: Float64Array[];
-  rPaths: Float64Array[];
-  finalEquity: number[];
-  maxDrawdowns: number[];
-  medianIdx: number;
-  bestIdx: number;
-  worstIdx: number;
-  equityMin: number;
-  equityMax: number;
-  stats: {
-    final5: number;
-    final50: number;
-    final95: number;
-    dd5: number;
-    dd50: number;
-    dd95: number;
-    mcl5: number;
-    mcl50: number;
-    mcl95: number;
-  };
-  drawdowns: {
-    median: number[];
-    best: number[];
-    worst: number[];
-  };
-  maxConsecutiveLosses: {
-    median: number;
-    best: number;
-    worst: number;
-  };
-  monthlyTables: {
-    median: MonthlyStatsRow[];
-    p5: MonthlyStatsRow[];
-    p95: MonthlyStatsRow[];
-  };
-  histograms: {
-    drawdown: Histogram;
-    finalEquity: Histogram;
-  };
-};
+type Point = { x: number; y: number };
 
 const defaultBuckets: Bucket[] = [
   {
@@ -177,402 +121,12 @@ function roundTo(value: number, step: number) {
   return Math.round(value / step) * step;
 }
 
-function mulberry32(seed: number) {
-  let a = seed >>> 0;
-  return () => {
-    a += 0x6d2b79f5;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function createRng(seed?: number) {
-  if (!Number.isFinite(seed)) {
-    return Math.random;
+function toPoints(values: ArrayLike<number>) {
+  const points: Point[] = new Array(values.length);
+  for (let i = 0; i < values.length; i += 1) {
+    points[i] = { x: i + 1, y: values[i] };
   }
-  return mulberry32(Math.trunc(seed as number));
-}
-
-function percentile(values: number[], p: number) {
-  if (values.length === 0) {
-    return 0;
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const index = (p / 100) * (sorted.length - 1);
-  const lo = Math.floor(index);
-  const hi = Math.ceil(index);
-  if (lo === hi) {
-    return sorted[lo];
-  }
-  const t = index - lo;
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * t;
-}
-
-function maxDrawdown(series: Float64Array) {
-  if (series.length === 0) return 0;
-  let peak = series[0];
-  let minDd = 0;
-  for (let i = 0; i < series.length; i += 1) {
-    const v = series[i];
-    if (v > peak) {
-      peak = v;
-    }
-    const dd = v / peak - 1;
-    if (dd < minDd) {
-      minDd = dd;
-    }
-  }
-  return minDd;
-}
-
-function drawdownSeries(series: Float64Array) {
-  const out = new Array(series.length).fill(0);
-  if (series.length === 0) return out;
-  let peak = series[0];
-  for (let i = 0; i < series.length; i += 1) {
-    const v = series[i];
-    if (v > peak) {
-      peak = v;
-    }
-    out[i] = v / peak - 1;
-  }
-  return out;
-}
-
-function maxConsecutiveLosses(rPath: Float64Array) {
-  let maxRun = 0;
-  let run = 0;
-  for (let i = 0; i < rPath.length; i += 1) {
-    if (rPath[i] < 0) {
-      run += 1;
-      if (run > maxRun) {
-        maxRun = run;
-      }
-    } else {
-      run = 0;
-    }
-  }
-  return maxRun;
-}
-
-function monthlyStatsFromPath(
-  equityPath: Float64Array,
-  rPath: Float64Array,
-  startEquity: number,
-  tradesPerMonth: number,
-  startYear: number,
-  startMonth: number
-) {
-  const nTrades = equityPath.length;
-  const safeTradesPerMonth = Math.max(1, tradesPerMonth);
-  const nMonths = Math.ceil(nTrades / safeTradesPerMonth);
-  const rows: MonthlyStatsRow[] = [];
-  let prevEquity = startEquity;
-  let year = startYear;
-  let month = startMonth;
-
-  for (let m = 0; m < nMonths; m += 1) {
-    const startIdx = m * safeTradesPerMonth;
-    const endIdx = Math.min((m + 1) * safeTradesPerMonth, nTrades) - 1;
-    if (endIdx < startIdx) break;
-
-    const endEquity = equityPath[endIdx];
-    const returnValue = endEquity / prevEquity - 1;
-
-    let peak = prevEquity;
-    let minDd = 0;
-    for (let i = startIdx; i <= endIdx; i += 1) {
-      const value = equityPath[i];
-      if (value > peak) peak = value;
-      const dd = value / peak - 1;
-      if (dd < minDd) minDd = dd;
-    }
-
-    let wins = 0;
-    let losses = 0;
-    let maxLossStreak = 0;
-    let lossStreak = 0;
-    for (let i = startIdx; i <= endIdx; i += 1) {
-      const r = rPath[i];
-      if (r > 0) {
-        wins += 1;
-        lossStreak = 0;
-      } else if (r < 0) {
-        losses += 1;
-        lossStreak += 1;
-        if (lossStreak > maxLossStreak) maxLossStreak = lossStreak;
-      } else {
-        lossStreak = 0;
-      }
-    }
-    const trades = wins + losses;
-    const winRate = trades === 0 ? 0 : wins / trades;
-
-    rows.push({
-      year,
-      month,
-      returnValue,
-      maxDrawdown: minDd,
-      winRate,
-      maxConsecutiveLosses: maxLossStreak,
-      endEquity,
-    });
-
-    prevEquity = endEquity;
-    month += 1;
-    if (month === 13) {
-      month = 1;
-      year += 1;
-    }
-  }
-
-  return rows;
-}
-
-function histogram(values: number[], binCount: number) {
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const span = max - min || 1;
-  const bins = new Array(binCount).fill(0).map((_, i) => min + (i * span) / binCount);
-  const counts = new Array(binCount).fill(0);
-  for (const v of values) {
-    const idx = Math.min(
-      binCount - 1,
-      Math.max(0, Math.floor(((v - min) / span) * binCount))
-    );
-    counts[idx] += 1;
-  }
-  return { bins, counts, min, max } satisfies Histogram;
-}
-
-function runSimulation({
-  startEquity,
-  nTrades,
-  nPaths,
-  riskFraction,
-  seed,
-  tradesPerMonth,
-  startYear,
-  startMonth,
-  buckets,
-  progressive,
-}: {
-  startEquity: number;
-  nTrades: number;
-  nPaths: number;
-  riskFraction: number;
-  seed: number | null;
-  tradesPerMonth: number;
-  startYear: number;
-  startMonth: number;
-  buckets: Bucket[];
-  progressive: {
-    lossStreakThreshold: number;
-    winStreakThreshold: number;
-    minRisk: number;
-    maxRisk: number;
-  } | null;
-}): SimulationResult {
-  const safeTrades = Math.max(1, Math.trunc(nTrades));
-  const safePaths = Math.max(1, Math.trunc(nPaths));
-  const probs = buckets.map((b) => Math.max(0, b.p));
-  const probSum = probs.reduce((acc, p) => acc + p, 0) || 1;
-  const normProbs = probs.map((p) => p / probSum);
-  const cumProbs = normProbs.reduce((acc: number[], p) => {
-    const prev = acc.length ? acc[acc.length - 1] : 0;
-    acc.push(prev + p);
-    return acc;
-  }, []);
-  const rng = createRng(seed ?? undefined);
-
-  const equityPaths: Float64Array[] = new Array(safePaths);
-  const rPaths: Float64Array[] = new Array(safePaths);
-  const finalEquity: number[] = new Array(safePaths).fill(0);
-  const maxDrawdowns: number[] = new Array(safePaths).fill(0);
-  const maxConsecutiveLossesAll: number[] = new Array(safePaths).fill(0);
-  let equityMin = Number.POSITIVE_INFINITY;
-  let equityMax = Number.NEGATIVE_INFINITY;
-
-  for (let path = 0; path < safePaths; path += 1) {
-    const equityPath = new Float64Array(safeTrades);
-    const rPath = new Float64Array(safeTrades);
-    let equity = startEquity;
-    let currentRisk = riskFraction;
-    let lossStreak = 0;
-    let winStreak = 0;
-    let peak = equity;
-    let minDd = 0;
-
-    for (let t = 0; t < safeTrades; t += 1) {
-      const r = rng();
-      const idx = cumProbs.findIndex((p) => r <= p);
-      const bucket = buckets[idx === -1 ? buckets.length - 1 : idx];
-      let sample = 0;
-      if (bucket.type === "point") {
-        sample = bucket.v ?? 0;
-      } else {
-        const lo = bucket.lo ?? 0;
-        const hi = bucket.hi ?? 0;
-        sample = lo + (hi - lo) * rng();
-      }
-      rPath[t] = sample;
-      equity *= 1 + currentRisk * sample;
-      equityPath[t] = equity;
-      if (equity > peak) {
-        peak = equity;
-      }
-      const dd = equity / peak - 1;
-      if (dd < minDd) {
-        minDd = dd;
-      }
-
-      if (progressive) {
-        if (sample > 0) {
-          winStreak += 1;
-          lossStreak = 0;
-          if (winStreak >= Math.max(1, Math.trunc(progressive.winStreakThreshold))) {
-            currentRisk = Math.min(progressive.maxRisk, currentRisk * 2);
-            winStreak = 0;
-          }
-        } else if (sample < 0) {
-          lossStreak += 1;
-          winStreak = 0;
-          if (lossStreak >= Math.max(1, Math.trunc(progressive.lossStreakThreshold))) {
-            currentRisk = Math.max(progressive.minRisk, currentRisk / 2);
-            lossStreak = 0;
-          }
-        } else {
-          winStreak = 0;
-          lossStreak = 0;
-        }
-      }
-    }
-
-    for (let i = 0; i < equityPath.length; i += 1) {
-      const value = equityPath[i];
-      if (value < equityMin) equityMin = value;
-      if (value > equityMax) equityMax = value;
-    }
-    equityPaths[path] = equityPath;
-    rPaths[path] = rPath;
-    finalEquity[path] = equityPath[safeTrades - 1] ?? equity;
-    maxDrawdowns[path] = minDd;
-    maxConsecutiveLossesAll[path] = maxConsecutiveLosses(rPath);
-  }
-
-  const final5 = percentile(finalEquity, 5);
-  const final50 = percentile(finalEquity, 50);
-  const final95 = percentile(finalEquity, 95);
-  const dd5 = percentile(maxDrawdowns, 5);
-  const dd50 = percentile(maxDrawdowns, 50);
-  const dd95 = percentile(maxDrawdowns, 95);
-  const mcl5 = percentile(maxConsecutiveLossesAll, 5);
-  const mcl50 = percentile(maxConsecutiveLossesAll, 50);
-  const mcl95 = percentile(maxConsecutiveLossesAll, 95);
-
-  const medianValue = final50;
-  const p5Value = final5;
-  const p95Value = final95;
-  let medianIdx = 0;
-  let p5Idx = 0;
-  let p95Idx = 0;
-  let bestIdx = 0;
-  let worstIdx = 0;
-  let bestValue = Number.NEGATIVE_INFINITY;
-  let worstValue = Number.POSITIVE_INFINITY;
-  let closest = Number.POSITIVE_INFINITY;
-  let closestP5 = Number.POSITIVE_INFINITY;
-  let closestP95 = Number.POSITIVE_INFINITY;
-
-  for (let i = 0; i < finalEquity.length; i += 1) {
-    const value = finalEquity[i];
-    if (value > bestValue) {
-      bestValue = value;
-      bestIdx = i;
-    }
-    if (value < worstValue) {
-      worstValue = value;
-      worstIdx = i;
-    }
-    const distance = Math.abs(value - medianValue);
-    if (distance < closest) {
-      closest = distance;
-      medianIdx = i;
-    }
-    const distanceP5 = Math.abs(value - p5Value);
-    if (distanceP5 < closestP5) {
-      closestP5 = distanceP5;
-      p5Idx = i;
-    }
-    const distanceP95 = Math.abs(value - p95Value);
-    if (distanceP95 < closestP95) {
-      closestP95 = distanceP95;
-      p95Idx = i;
-    }
-  }
-
-  const drawdowns = {
-    median: drawdownSeries(equityPaths[medianIdx]),
-    best: drawdownSeries(equityPaths[bestIdx]),
-    worst: drawdownSeries(equityPaths[worstIdx]),
-  };
-
-  const maxConsecutiveLossesByPath = {
-    median: maxConsecutiveLossesAll[medianIdx],
-    best: maxConsecutiveLossesAll[bestIdx],
-    worst: maxConsecutiveLossesAll[worstIdx],
-  };
-
-  const monthlyTables = {
-    median: monthlyStatsFromPath(
-      equityPaths[medianIdx],
-      rPaths[medianIdx],
-      startEquity,
-      tradesPerMonth,
-      startYear,
-      startMonth
-    ),
-    p5: monthlyStatsFromPath(
-      equityPaths[p5Idx],
-      rPaths[p5Idx],
-      startEquity,
-      tradesPerMonth,
-      startYear,
-      startMonth
-    ),
-    p95: monthlyStatsFromPath(
-      equityPaths[p95Idx],
-      rPaths[p95Idx],
-      startEquity,
-      tradesPerMonth,
-      startYear,
-      startMonth
-    ),
-  };
-
-  const histograms = {
-    drawdown: histogram(maxDrawdowns, 60),
-    finalEquity: histogram(finalEquity, 60),
-  };
-
-  return {
-    equityPaths,
-    rPaths,
-    finalEquity,
-    maxDrawdowns,
-    medianIdx,
-    bestIdx,
-    worstIdx,
-    equityMin,
-    equityMax,
-    stats: { final5, final50, final95, dd5, dd50, dd95, mcl5, mcl50, mcl95 },
-    drawdowns,
-    maxConsecutiveLosses: maxConsecutiveLossesByPath,
-    monthlyTables,
-    histograms,
-  };
+  return points;
 }
 
 function parseNumber(value: string) {
@@ -580,21 +134,100 @@ function parseNumber(value: string) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function MonthlyTableView({ title, rows }: { title: string; rows: MonthlyStatsRow[] }) {
+// Validated as a colorblind-safe pair on both light and dark panels.
+const gainColor = "#3b82f6";
+const lossColor = "#ea580c";
+
+const MonthlyReturnsChart = memo(function MonthlyReturnsChart({
+  title,
+  rows,
+  yRange,
+}: {
+  title: string;
+  rows: MonthlyStatsRow[];
+  /** Shared across the three charts so their bars compare directly. */
+  yRange: { min: number; max: number };
+}) {
   const totalReturn =
     rows.length === 0
       ? 0
       : rows.reduce((acc, row) => acc * (1 + row.returnValue), 1) - 1;
-  const enableScroll = rows.length > 15;
+  const positiveMonths = rows.filter((row) => row.returnValue > 0).length;
 
-  const cellStyle = (value: number) => {
-    if (value >= 0.1) return "bg-emerald-500/20 text-emerald-200";
-    if (value >= 0.03) return "bg-emerald-500/10 text-emerald-100";
-    if (value > 0) return "bg-emerald-500/5 text-emerald-100";
-    if (value <= -0.1) return "bg-rose-500/20 text-rose-200";
-    if (value <= -0.03) return "bg-rose-500/10 text-rose-100";
-    return "bg-rose-500/5 text-rose-100";
-  };
+  const data = useMemo(
+    () => ({
+      labels: rows.map((row) => `${monthNames[row.month - 1]} ${String(row.year).slice(-2)}`),
+      datasets: [
+        {
+          label: "Monthly return",
+          data: rows.map((row) => row.returnValue),
+          backgroundColor: rows.map((row) => (row.returnValue >= 0 ? gainColor : lossColor)),
+          borderRadius: 4,
+          borderSkipped: "start" as const,
+          categoryPercentage: 0.85,
+          barPercentage: 0.9,
+          maxBarThickness: 28,
+        },
+      ],
+    }),
+    [rows]
+  );
+
+  const options = useMemo(
+    () => ({
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false as const,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          intersect: false,
+          mode: "index" as const,
+          callbacks: {
+            title: (items: { dataIndex: number }[]) => {
+              const row = rows[items[0].dataIndex];
+              return `${monthNames[row.month - 1]} ${row.year}`;
+            },
+            label: (item: { dataIndex: number }) => {
+              const row = rows[item.dataIndex];
+              return [
+                `Return: ${percentFormatter.format(row.returnValue)}`,
+                `Max DD: ${percentFormatter.format(row.maxDrawdown)}`,
+                `Win rate: ${percentFormatter.format(row.winRate)}`,
+                `Max losses in a row: ${row.maxConsecutiveLosses}`,
+                `End equity: ${currencyFormatter.format(row.endEquity)}`,
+              ];
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: {
+            autoSkip: true,
+            maxRotation: 0,
+            maxTicksLimit: 8,
+            color: "#9ca3af",
+          },
+        },
+        y: {
+          min: yRange.min,
+          max: yRange.max,
+          grid: {
+            color: (ctx: { tick: { value: number } }) =>
+              ctx.tick.value === 0 ? "rgba(148, 163, 184, 0.6)" : "rgba(0,0,0,0.05)",
+          },
+          ticks: {
+            maxTicksLimit: 6,
+            color: "#9ca3af",
+            callback: (value: string | number) => percentFormatter.format(Number(value)),
+          },
+        },
+      },
+    }),
+    [rows, yRange]
+  );
 
   return (
     <div className="panel rounded-2xl border border-black/5 p-4 shadow-lg shadow-black/5">
@@ -602,76 +235,68 @@ function MonthlyTableView({ title, rows }: { title: string; rows: MonthlyStatsRo
         <div className="flex flex-col">
           <h3 className="text-lg font-semibold text-[color:var(--panel-ink)]">{title}</h3>
           <span className="text-xs text-[color:var(--muted)]">
-            Total return: {percentFormatter.format(totalReturn)}
+            Total return: {percentFormatter.format(totalReturn)} · {positiveMonths} of{" "}
+            {rows.length} months positive
           </span>
         </div>
         <span className="mono text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
           Monthly Returns
         </span>
       </div>
-      <div
-        className={`overflow-x-auto ${enableScroll ? "max-h-[560px] overflow-y-auto pr-1" : ""}`}
-      >
-        <table className="min-w-[520px] table-fixed text-sm">
-          <thead className="text-center text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
-            <tr>
-              <th className="w-[80px] pb-2 pr-2">Month</th>
-              <th className="w-[52px] pb-2 pr-2">Return</th>
-              <th className="w-[52px] pb-2 pr-2">DD</th>
-              <th className="w-[52px] pb-2 pr-2">WR</th>
-              <th className="w-[52px] pb-2 pr-2">Max Losses</th>
-              <th className="w-[96px] pb-2 pr-2">Equity</th>
-            </tr>
-          </thead>
-          <tbody className="text-[color:var(--panel-ink)]">
-            {rows.map((row) => {
-              const label = `${monthNames[row.month - 1]} ${row.year}`;
-              return (
-                <tr key={`${row.year}-${row.month}`} className="border-t border-black/5">
-                  <td className="w-[80px] py-2 pr-2 text-center font-semibold">{label}</td>
-                  <td className="py-2 pr-1">
-                    <span
-                      className={`inline-flex w-[52px] justify-center rounded-lg px-1 py-0.5 text-[10px] font-semibold ${cellStyle(
-                        row.returnValue
-                      )}`}
-                    >
-                      {percentFormatter.format(row.returnValue)}
-                    </span>
-                  </td>
-                  <td className="py-2 pr-1">
-                    <span className="inline-flex w-[52px] justify-center rounded-lg border border-black/5 px-1 py-0.5 text-[10px] font-semibold">
-                      {percentFormatter.format(row.maxDrawdown)}
-                    </span>
-                  </td>
-                  <td className="py-2 pr-1">
-                    <span className="inline-flex w-[52px] justify-center rounded-lg border border-black/5 px-1 py-0.5 text-[10px] font-semibold">
-                      {percentFormatter.format(row.winRate)}
-                    </span>
-                  </td>
-                  <td className="py-2 pr-1">
-                    <span className="inline-flex w-[52px] justify-center rounded-lg border border-black/5 px-1 py-0.5 text-[10px] font-semibold">
-                      {numberFormatter.format(row.maxConsecutiveLosses)}
-                    </span>
-                  </td>
-                  <td className="w-[96px] py-2 pr-1 text-center">
-                    <span className="inline-flex w-full justify-center rounded-lg border border-black/5 px-2 py-1 text-xs font-semibold">
-                      {currencyFormatter.format(row.endEquity)}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div className="h-[240px] w-full">
+        <Bar data={data} options={options} />
       </div>
     </div>
   );
-}
+});
+
+const MetricsTable = memo(function MetricsTable({ metrics }: { metrics: PathMetrics[] }) {
+  return (
+    <div className="mt-4 overflow-x-auto">
+      <table className="w-full border-collapse border border-white/20 text-xs">
+        <thead className="text-center uppercase tracking-[0.2em] text-[color:var(--muted)]">
+          <tr>
+            <th className="border border-white/20 px-2 py-2">Pct</th>
+            <th className="border border-white/20 px-2 py-2">Total Ret (Ann)</th>
+            <th className="border border-white/20 px-2 py-2">Max DD</th>
+            <th className="border border-white/20 px-2 py-2">Std Dev</th>
+            <th className="border border-white/20 px-2 py-2">Sharpe (Ann)</th>
+            <th className="border border-white/20 px-2 py-2">Calmar (Ann)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {metrics.map((metric) => (
+            <tr key={metric.label}>
+              <td className="border border-white/20 px-2 py-2 text-center font-semibold">
+                {metric.label}
+              </td>
+              <td className="border border-white/20 px-2 py-2 text-center">
+                {percentFormatter.format(metric.totalReturn)}
+              </td>
+              <td className="border border-white/20 px-2 py-2 text-center">
+                {percentFormatter.format(metric.maxDrawdown)}
+              </td>
+              <td className="border border-white/20 px-2 py-2 text-center">
+                {percentFormatter.format(metric.stdDev)}
+              </td>
+              <td className="border border-white/20 px-2 py-2 text-center">
+                {metric.sharpe.toFixed(2)}
+              </td>
+              <td className="border border-white/20 px-2 py-2 text-center">
+                {metric.calmar.toFixed(2)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+});
 
 export default function Home() {
   const [startEquity, setStartEquity] = useState(300000);
-  const [startEquityInput, setStartEquityInput] = useState(
-    new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(300000)
+  const [startEquityInput, setStartEquityInput] = useState(() =>
+    numberFormatter.format(300000)
   );
   const [nTrades, setNTrades] = useState(600);
   const [nPaths, setNPaths] = useState(1000);
@@ -681,20 +306,47 @@ export default function Home() {
   const [tradesPerMonth, setTradesPerMonth] = useState(50);
   const [startYear, setStartYear] = useState(2026);
   const [startMonth, setStartMonth] = useState(1);
+  const [outcomeUnit, setOutcomeUnit] = useState<OutcomeUnit>("r");
   const [buckets, setBuckets] = useState<Bucket[]>(defaultBuckets);
+  // Created from the R buckets the first time "% of equity" is selected.
+  const [bucketsPct, setBucketsPct] = useState<Bucket[] | null>(null);
   const [useProgressiveExposure, setUseProgressiveExposure] = useState(false);
   const [lossStreakThreshold, setLossStreakThreshold] = useState(3);
   const [winStreakThreshold, setWinStreakThreshold] = useState(3);
   const [minRiskPercent, setMinRiskPercent] = useState(0.1);
   const [maxRiskPercent, setMaxRiskPercent] = useState(1.0);
+  const [minSizeMultiple, setMinSizeMultiple] = useState(0.25);
+  const [maxSizeMultiple, setMaxSizeMultiple] = useState(4);
   const [selectedPathIndex, setSelectedPathIndex] = useState(1);
   const [results, setResults] = useState<SimulationResult | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  // Saving waits until stored inputs are restored; otherwise the first save
+  // (and Strict Mode's second mount) would overwrite them with the defaults.
+  const [storageLoaded, setStorageLoaded] = useState(false);
+  const workerRef = useRef<Worker | null>(null);
 
   useEffect(() => {
-    const raw = localStorage.getItem("mc_inputs_v1");
-    if (!raw) return;
+    const worker = new Worker(new URL("../lib/simulation.worker.ts", import.meta.url));
+    worker.onmessage = (event: MessageEvent<SimulationResult>) => {
+      setResults(event.data);
+      setSelectedPathIndex(1);
+      setIsRunning(false);
+    };
+    worker.onerror = (event) => {
+      console.error("Simulation failed", event.message);
+      setIsRunning(false);
+    };
+    workerRef.current = worker;
+    return () => {
+      worker.terminate();
+      workerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     try {
+      const raw = localStorage.getItem("mc_inputs_v1");
+      if (!raw) return;
       const saved = JSON.parse(raw) as Partial<{
         startEquity: number;
         startEquityInput: string;
@@ -706,12 +358,16 @@ export default function Home() {
         tradesPerMonth: number;
         startYear: number;
         startMonth: number;
+        outcomeUnit: OutcomeUnit;
         buckets: Bucket[];
+        bucketsPct: Bucket[] | null;
         useProgressiveExposure: boolean;
         lossStreakThreshold: number;
         winStreakThreshold: number;
         minRiskPercent: number;
         maxRiskPercent: number;
+        minSizeMultiple: number;
+        maxSizeMultiple: number;
         selectedPathIndex: number;
       }>;
 
@@ -726,7 +382,11 @@ export default function Home() {
       if (typeof saved.tradesPerMonth === "number") setTradesPerMonth(saved.tradesPerMonth);
       if (typeof saved.startYear === "number") setStartYear(saved.startYear);
       if (typeof saved.startMonth === "number") setStartMonth(saved.startMonth);
+      if (saved.outcomeUnit === "r" || saved.outcomeUnit === "percent")
+        setOutcomeUnit(saved.outcomeUnit);
       if (Array.isArray(saved.buckets) && saved.buckets.length > 0) setBuckets(saved.buckets);
+      if (Array.isArray(saved.bucketsPct) && saved.bucketsPct.length > 0)
+        setBucketsPct(saved.bucketsPct);
       if (typeof saved.useProgressiveExposure === "boolean")
         setUseProgressiveExposure(saved.useProgressiveExposure);
       if (typeof saved.lossStreakThreshold === "number")
@@ -735,13 +395,18 @@ export default function Home() {
         setWinStreakThreshold(saved.winStreakThreshold);
       if (typeof saved.minRiskPercent === "number") setMinRiskPercent(saved.minRiskPercent);
       if (typeof saved.maxRiskPercent === "number") setMaxRiskPercent(saved.maxRiskPercent);
+      if (typeof saved.minSizeMultiple === "number") setMinSizeMultiple(saved.minSizeMultiple);
+      if (typeof saved.maxSizeMultiple === "number") setMaxSizeMultiple(saved.maxSizeMultiple);
       if (typeof saved.selectedPathIndex === "number") setSelectedPathIndex(saved.selectedPathIndex);
     } catch {
-      // ignore invalid storage
+      // ignore invalid or unavailable storage
+    } finally {
+      setStorageLoaded(true);
     }
   }, []);
 
   useEffect(() => {
+    if (!storageLoaded) return;
     const payload = {
       startEquity,
       startEquityInput,
@@ -753,16 +418,28 @@ export default function Home() {
       tradesPerMonth,
       startYear,
       startMonth,
+      outcomeUnit,
       buckets,
+      bucketsPct,
       useProgressiveExposure,
       lossStreakThreshold,
       winStreakThreshold,
       minRiskPercent,
       maxRiskPercent,
+      minSizeMultiple,
+      maxSizeMultiple,
       selectedPathIndex,
     };
-    localStorage.setItem("mc_inputs_v1", JSON.stringify(payload));
+    const timer = setTimeout(() => {
+      try {
+        localStorage.setItem("mc_inputs_v1", JSON.stringify(payload));
+      } catch {
+        // storage full or unavailable
+      }
+    }, 300);
+    return () => clearTimeout(timer);
   }, [
+    storageLoaded,
     startEquity,
     startEquityInput,
     nTrades,
@@ -773,31 +450,44 @@ export default function Home() {
     tradesPerMonth,
     startYear,
     startMonth,
+    outcomeUnit,
     buckets,
+    bucketsPct,
     useProgressiveExposure,
     lossStreakThreshold,
     winStreakThreshold,
     minRiskPercent,
     maxRiskPercent,
+    minSizeMultiple,
+    maxSizeMultiple,
     selectedPathIndex,
   ]);
 
-  const probSum = useMemo(
-    () => buckets.reduce((acc, bucket) => acc + Math.max(0, bucket.p), 0),
-    [buckets]
-  );
+  const isPercent = outcomeUnit === "percent";
+  const activeBuckets = isPercent ? (bucketsPct ?? buckets) : buckets;
+  const setActiveBuckets = isPercent ? setBucketsPct : setBuckets;
+  const unitSuffix = isPercent ? "%" : "R";
 
-  const tradeLabels = useMemo(() => {
-    const length = results?.equityPaths[0]?.length ?? Math.max(1, Math.trunc(nTrades));
-    return Array.from({ length }, (_, i) => `${i + 1}`);
-  }, [results, nTrades]);
+  const handleOutcomeUnitChange = (next: OutcomeUnit) => {
+    if (next === "percent" && !bucketsPct) {
+      // Seed the % buckets with what the R buckets mean at the current risk,
+      // so switching starts from an equivalent setup.
+      const toPct = (r: number | undefined) =>
+        r === undefined ? undefined : Number((r * riskFraction * 100).toFixed(2));
+      setBucketsPct(
+        buckets.map((b) => ({ ...b, lo: toPct(b.lo), hi: toPct(b.hi), v: toPct(b.v) }))
+      );
+    }
+    setOutcomeUnit(next);
+  };
+
+  const probSum = useMemo(
+    () => activeBuckets.reduce((acc, bucket) => acc + Math.max(0, bucket.p), 0),
+    [activeBuckets]
+  );
 
   const percentileEquityData = useMemo(() => {
     if (!results) return null;
-    const percentiles = [10, 20, 30, 40, 50, 60, 70, 80, 90];
-    const tradeCount = results.equityPaths[0]?.length ?? 0;
-    if (tradeCount === 0) return null;
-
     const palette = [
       "#7a7a7a",
       "#1d4ed8",
@@ -810,44 +500,35 @@ export default function Home() {
       "#a855f7",
     ];
 
-    const datasets: ChartDataset<"line", number[]>[] = percentiles.map((p, pIdx) => {
-      const target = percentile(results.finalEquity, p);
-      let closestIdx = 0;
-      let closest = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < results.finalEquity.length; i += 1) {
-        const dist = Math.abs(results.finalEquity[i] - target);
-        if (dist < closest) {
-          closest = dist;
-          closestIdx = i;
-        }
-      }
-
-      const path = results.equityPaths[closestIdx];
-      const color = palette[pIdx % palette.length];
-
-      return {
+    const datasets: ChartDataset<"line", Point[]>[] = results.percentilePaths.map(
+      ({ p, equity }, pIdx) => ({
         label: `${p}th percentile path`,
-        data: Array.from(path),
-        borderColor: color,
+        data: toPoints(equity),
+        borderColor: palette[pIdx % palette.length],
         borderWidth: p === 50 ? 3.5 : 1,
         pointRadius: 0,
-        tension: 0.2,
-      };
-    });
+        tension: 0,
+      })
+    );
 
     datasets.push({
       label: "Worst path",
-      data: Array.from(results.equityPaths[results.worstIdx]),
+      data: toPoints(results.worstPath),
       borderColor: "#ef4444",
       borderWidth: 2.5,
       pointRadius: 0,
-      tension: 0.2,
+      tension: 0,
       borderDash: [6, 4],
     });
 
+    // A flat line only needs its two endpoints.
+    const runStartEquity = results.input.startEquity;
     datasets.push({
       label: "Starting equity",
-      data: new Array(tradeCount).fill(startEquity),
+      data: [
+        { x: 1, y: runStartEquity },
+        { x: results.nTrades, y: runStartEquity },
+      ],
       borderColor: "rgba(148, 163, 184, 0.9)",
       borderWidth: 1.8,
       pointRadius: 0,
@@ -855,129 +536,66 @@ export default function Home() {
       borderDash: [4, 4],
     });
 
-    return { labels: tradeLabels, datasets };
-  }, [results, tradeLabels, startEquity]);
-
-  const percentilePathMetrics = useMemo(() => {
-    if (!results) return null;
-    const percentiles = [10, 20, 30, 40, 50, 60, 70, 80, 90];
-    const tradesPerYear = Math.max(1, Math.trunc(tradesPerMonth)) * 12;
-    const metrics = percentiles.map((p) => {
-      const target = percentile(results.finalEquity, p);
-      let closestIdx = 0;
-      let closest = Number.POSITIVE_INFINITY;
-      for (let i = 0; i < results.finalEquity.length; i += 1) {
-        const dist = Math.abs(results.finalEquity[i] - target);
-        if (dist < closest) {
-          closest = dist;
-          closestIdx = i;
-        }
-      }
-
-      const equityPath = results.equityPaths[closestIdx];
-      const totalReturn = equityPath[equityPath.length - 1] / startEquity - 1;
-      const nTrades = equityPath.length;
-      const annualizedReturn =
-        nTrades === 0
-          ? 0
-          : Math.pow(1 + totalReturn, tradesPerYear / nTrades) - 1;
-
-      const tradeReturns: number[] = new Array(nTrades);
-      for (let i = 0; i < nTrades; i += 1) {
-        const prev = i === 0 ? startEquity : equityPath[i - 1];
-        tradeReturns[i] = prev === 0 ? 0 : equityPath[i] / prev - 1;
-      }
-      const meanReturn = tradeReturns.reduce((acc, v) => acc + v, 0) / Math.max(1, nTrades);
-      const variance =
-        tradeReturns.reduce((acc, v) => acc + (v - meanReturn) ** 2, 0) /
-        Math.max(1, nTrades - 1);
-      const stdDev = Math.sqrt(variance);
-      const sharpe = stdDev === 0 ? 0 : (meanReturn / stdDev) * Math.sqrt(tradesPerYear);
-      const dd = maxDrawdown(equityPath);
-      const calmar = dd === 0 ? 0 : annualizedReturn / Math.abs(dd);
-
-      return {
-        label: `${p}th`,
-        totalReturn: annualizedReturn,
-        sharpe,
-        calmar,
-        maxDrawdown: dd,
-        stdDev: stdDev * Math.sqrt(tradesPerYear),
-      };
-    });
-    const worstPath = results.equityPaths[results.worstIdx];
-    const worstTotalReturn = worstPath[worstPath.length - 1] / startEquity - 1;
-    const nTrades = worstPath.length;
-    const annualizedReturn =
-      nTrades === 0 ? 0 : Math.pow(1 + worstTotalReturn, tradesPerYear / nTrades) - 1;
-    const worstTradeReturns: number[] = new Array(nTrades);
-    for (let i = 0; i < nTrades; i += 1) {
-      const prev = i === 0 ? startEquity : worstPath[i - 1];
-      worstTradeReturns[i] = prev === 0 ? 0 : worstPath[i] / prev - 1;
-    }
-    const meanReturn =
-      worstTradeReturns.reduce((acc, v) => acc + v, 0) / Math.max(1, nTrades);
-    const variance =
-      worstTradeReturns.reduce((acc, v) => acc + (v - meanReturn) ** 2, 0) /
-      Math.max(1, nTrades - 1);
-    const stdDev = Math.sqrt(variance);
-    const sharpe = stdDev === 0 ? 0 : (meanReturn / stdDev) * Math.sqrt(tradesPerYear);
-    const dd = maxDrawdown(worstPath);
-    const calmar = dd === 0 ? 0 : annualizedReturn / Math.abs(dd);
-
-    const worstMetric = {
-      label: "Worst",
-      totalReturn: annualizedReturn,
-      sharpe,
-      calmar,
-      maxDrawdown: dd,
-      stdDev: stdDev * Math.sqrt(tradesPerYear),
-    };
-    return [worstMetric, ...metrics];
-  }, [results, startEquity, tradesPerMonth]);
+    return { datasets };
+  }, [results]);
 
   const drawdownData = useMemo(() => {
     if (!results) return null;
     return {
-      labels: tradeLabels,
       datasets: [
         {
           label: "Median",
-          data: results.drawdowns.median,
+          data: toPoints(results.drawdowns.median),
           borderColor: "#2563eb",
           borderWidth: 2,
           pointRadius: 0,
-          tension: 0.2,
+          tension: 0,
         },
         {
           label: "Best",
-          data: results.drawdowns.best,
+          data: toPoints(results.drawdowns.best),
           borderColor: "#16a34a",
           borderWidth: 2,
           pointRadius: 0,
-          tension: 0.2,
+          tension: 0,
         },
         {
           label: "Worst",
-          data: results.drawdowns.worst,
+          data: toPoints(results.drawdowns.worst),
           borderColor: "#dc2626",
           borderWidth: 2,
           pointRadius: 0,
-          tension: 0.2,
+          tension: 0,
         },
       ],
     };
-  }, [results, tradeLabels]);
+  }, [results]);
 
   const riskOfRuin = useMemo(() => {
     if (!results) return null;
     const threshold = Math.abs(riskOfRuinThreshold) / 100;
-    const count = results.maxDrawdowns.filter((dd) => Math.abs(dd) >= threshold).length;
+    let count = 0;
+    for (const dd of results.maxDrawdowns) {
+      if (Math.abs(dd) >= threshold) count += 1;
+    }
     return {
       threshold,
       probability: count / results.maxDrawdowns.length,
     };
   }, [results, riskOfRuinThreshold]);
+
+  const monthlyReturnRange = useMemo(() => {
+    if (!results) return null;
+    const { median, p5, p95 } = results.monthlyTables;
+    let min = 0;
+    let max = 0;
+    for (const row of [...median, ...p5, ...p95]) {
+      if (row.returnValue < min) min = row.returnValue;
+      if (row.returnValue > max) max = row.returnValue;
+    }
+    const pad = (max - min) * 0.08 || 0.01;
+    return { min: min < 0 ? min - pad : 0, max: max + pad };
+  }, [results]);
 
   const drawdownHistogramData = useMemo(() => {
     if (!results) return null;
@@ -1011,27 +629,49 @@ export default function Home() {
     };
   }, [results]);
 
+  const simContext = useMemo(
+    () => (results ? createSimContext(results.input) : null),
+    [results]
+  );
+
   const tradeResultsData = useMemo(() => {
-    if (!results) return null;
-    const totalPaths = results.rPaths.length;
+    if (!results || !simContext) return null;
     const clampedIndex = Math.min(
       Math.max(1, Math.trunc(selectedPathIndex)),
-      totalPaths
+      results.nPaths
     );
-    const rPath = results.rPaths[clampedIndex - 1];
-    const equityPath = results.equityPaths[clampedIndex - 1];
-    if (!rPath) return null;
-    const colors = Array.from(rPath).map((y) => {
-      if (y <= -0.5) return "rgba(239, 68, 68, 0.85)";
-      if (y < 0) return "rgba(249, 115, 22, 0.75)";
-      if (y >= 5) return "rgba(34, 197, 94, 0.85)";
-      return "rgba(59, 130, 246, 0.6)";
-    });
+    // Only a few paths are kept after a run; regenerate the selected one from its seed.
+    const n = results.nTrades;
+    const rPath = new Float64Array(n);
+    const equityPath = new Float64Array(n);
+    simulatePath(simContext, clampedIndex - 1, equityPath, rPath);
+
+    // The R-size bands only mean something in R mode; % outcomes are colored by sign.
+    const rMode = results.input.outcomeUnit === "r";
+    const colors: string[] = new Array(n);
+    const rPoints: Point[] = new Array(n);
+    const equityPoints: Point[] = new Array(n);
+    for (let i = 0; i < n; i += 1) {
+      const y = rPath[i];
+      colors[i] = !rMode
+        ? y < 0
+          ? "rgba(239, 68, 68, 0.85)"
+          : "rgba(59, 130, 246, 0.6)"
+        : y <= -0.5
+          ? "rgba(239, 68, 68, 0.85)"
+          : y < 0
+            ? "rgba(249, 115, 22, 0.75)"
+            : y >= 5
+              ? "rgba(34, 197, 94, 0.85)"
+              : "rgba(59, 130, 246, 0.6)";
+      rPoints[i] = { x: i + 1, y };
+      equityPoints[i] = { x: i + 1, y: equityPath[i] };
+    }
     return {
       datasets: [
         {
           label: `Path ${clampedIndex}`,
-          data: Array.from(rPath).map((r, i) => ({ x: i + 1, y: r })),
+          data: rPoints,
           pointRadius: 2.5,
           pointHoverRadius: 4,
           borderColor: "rgba(37, 99, 235, 0.25)",
@@ -1042,7 +682,7 @@ export default function Home() {
         {
           label: `Equity ${clampedIndex}`,
           type: "line" as const,
-          data: Array.from(equityPath).map((e, i) => ({ x: i + 1, y: e })),
+          data: equityPoints,
           borderColor: "rgba(168, 85, 247, 0.95)",
           backgroundColor: "rgba(168, 85, 247, 0.95)",
           borderWidth: 2,
@@ -1050,17 +690,26 @@ export default function Home() {
           pointHoverRadius: 0,
           yAxisID: "yEquity",
           showLine: true,
-          tension: 0.12,
+          tension: 0,
         },
       ],
     };
-  }, [results, selectedPathIndex]);
+  }, [results, simContext, selectedPathIndex]);
 
+  // Line charts get {x, y} data on a linear x axis with parsing disabled, which
+  // skips Chart.js's parse step and lets the decimation plugin thin long paths.
   const chartOptions = useMemo(
     () => ({
       responsive: true,
       maintainAspectRatio: false,
+      animation: false as const,
+      parsing: false as const,
+      normalized: true,
       plugins: {
+        decimation: {
+          enabled: true,
+          algorithm: "lttb" as const,
+        },
         legend: {
           display: true,
           position: "bottom" as const,
@@ -1083,6 +732,7 @@ export default function Home() {
       },
       scales: {
         x: {
+          type: "linear" as const,
           grid: {
             color: "rgba(0,0,0,0.05)",
           },
@@ -1108,6 +758,7 @@ export default function Home() {
     () => ({
       responsive: true,
       maintainAspectRatio: false,
+      animation: false as const,
       plugins: {
         legend: {
           display: false,
@@ -1136,10 +787,14 @@ export default function Home() {
     []
   );
 
+  const scatterUnit = results?.input.outcomeUnit ?? outcomeUnit;
   const scatterOptions = useMemo(
     () => ({
       responsive: true,
       maintainAspectRatio: false,
+      animation: false as const,
+      parsing: false as const,
+      normalized: true,
       plugins: {
         legend: {
           display: false,
@@ -1176,7 +831,7 @@ export default function Home() {
           },
           title: {
             display: true,
-            text: "R multiple",
+            text: scatterUnit === "percent" ? "% of equity" : "R multiple",
             color: "#9ca3af",
           },
         },
@@ -1197,13 +852,16 @@ export default function Home() {
         },
       },
     }),
-    []
+    [scatterUnit]
   );
 
   const handleRun = () => {
+    const worker = workerRef.current;
+    if (!worker) return;
     setIsRunning(true);
     const seedNumber = seed.trim() === "" ? null : Number(seed);
-    const simulation = runSimulation({
+    const input: SimulationInput = {
+      outcomeUnit,
       startEquity,
       nTrades,
       nPaths,
@@ -1212,28 +870,24 @@ export default function Home() {
       tradesPerMonth,
       startYear,
       startMonth,
-      buckets,
+      buckets: activeBuckets,
       progressive: useProgressiveExposure
         ? {
             lossStreakThreshold,
             winStreakThreshold,
-            minRisk: minRiskPercent / 100,
-            maxRisk: maxRiskPercent / 100,
+            minRisk: isPercent ? minSizeMultiple : minRiskPercent / 100,
+            maxRisk: isPercent ? maxSizeMultiple : maxRiskPercent / 100,
           }
         : null,
-    });
-    setResults(simulation);
-    setSelectedPathIndex(1);
-    setIsRunning(false);
+    };
+    worker.postMessage(input);
   };
 
   const handleStartEquityBlur = () => {
     const normalized = startEquityInput.replace(/,/g, "");
     const value = parseNumber(normalized);
     setStartEquity(value);
-    setStartEquityInput(
-      new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(value)
-    );
+    setStartEquityInput(numberFormatter.format(value));
   };
 
   return (
@@ -1294,21 +948,24 @@ export default function Home() {
                       onChange={(e) => setNPaths(parseNumber(e.target.value))}
                     />
                   </label>
-                  <label className="flex flex-col gap-2 text-sm font-medium">
-                    Risk Per Trade
-                    <div className="relative">
-                      <input
-                        className="w-full rounded-xl border border-black/10 bg-transparent py-2 pl-3 pr-8 text-base"
-                        type="number"
-                        step="0.01"
-                        value={Number((riskFraction * 100).toFixed(4))}
-                        onChange={(e) => setRiskFraction(parseNumber(e.target.value) / 100)}
-                      />
-                      <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-[color:var(--muted)]">
-                        %
-                      </span>
-                    </div>
-                  </label>
+                  {/* % outcomes already are the equity change, so there is no risk to size by. */}
+                  {!isPercent && (
+                    <label className="flex flex-col gap-2 text-sm font-medium">
+                      Risk Per Trade
+                      <div className="relative">
+                        <input
+                          className="w-full rounded-xl border border-black/10 bg-transparent py-2 pl-3 pr-8 text-base"
+                          type="number"
+                          step="0.01"
+                          value={Number((riskFraction * 100).toFixed(4))}
+                          onChange={(e) => setRiskFraction(parseNumber(e.target.value) / 100)}
+                        />
+                        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-[color:var(--muted)]">
+                          %
+                        </span>
+                      </div>
+                    </label>
+                  )}
               <label className="flex flex-col gap-2 text-sm font-medium">
                 Random seed (blank = random)
                 <input
@@ -1385,31 +1042,65 @@ export default function Home() {
 
               <div className="flex min-w-0 flex-col gap-3 rounded-2xl border border-black/10 p-5 shadow-sm shadow-black/5">
                 <div className="flex items-center justify-between">
-                  <h3 className="text-base font-semibold text-[color:var(--muted)]">Buckets R multiples</h3>
+                  <h3 className="text-base font-semibold text-[color:var(--muted)]">
+                    {isPercent ? "Buckets % of equity" : "Buckets R multiples"}
+                  </h3>
                   <span className="mono text-xs text-[color:var(--muted)]">
                     Sum = {numberFormatter.format(probSum)}
                   </span>
                 </div>
+                <div
+                  role="radiogroup"
+                  aria-label="Outcome unit"
+                  className="grid grid-cols-2 gap-1 rounded-xl border border-black/10 p-1 text-xs font-semibold"
+                >
+                  {(
+                    [
+                      ["r", "R multiples"],
+                      ["percent", "% of equity"],
+                    ] as const
+                  ).map(([unit, label]) => (
+                    <button
+                      key={unit}
+                      type="button"
+                      role="radio"
+                      aria-checked={outcomeUnit === unit}
+                      onClick={() => handleOutcomeUnitChange(unit)}
+                      className={`rounded-lg px-2 py-1.5 transition ${
+                        outcomeUnit === unit
+                          ? "bg-indigo-500 text-white"
+                          : "text-[color:var(--muted)] hover:bg-black/5"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-[color:var(--muted)]">
+                  {isPercent
+                    ? "Each outcome is the trade's gain or loss as a % of total equity."
+                    : "Each outcome is a multiple of the amount risked per trade."}
+                </p>
                 <div className="grid gap-3">
-                  {buckets.map((bucket, idx) => (
+                  {activeBuckets.map((bucket, idx) => (
                     <div key={bucket.id} className="rounded-2xl border border-black/5 p-3">
                       <div className="flex items-center justify-between gap-2">
                         <input
                           className="w-full rounded-lg border border-black/10 bg-transparent px-2 py-1 text-sm font-semibold"
                           value={bucket.name}
                           onChange={(e) => {
-                            const next = [...buckets];
+                            const next = [...activeBuckets];
                             next[idx] = { ...bucket, name: e.target.value };
-                            setBuckets(next);
+                            setActiveBuckets(next);
                           }}
                         />
                         <select
                           className="rounded-lg border border-black/10 bg-transparent px-2 py-1 text-xs uppercase"
                           value={bucket.type}
                           onChange={(e) => {
-                            const next = [...buckets];
+                            const next = [...activeBuckets];
                             next[idx] = { ...bucket, type: e.target.value as BucketType };
-                            setBuckets(next);
+                            setActiveBuckets(next);
                           }}
                         >
                           <option value="uniform">Range</option>
@@ -1426,9 +1117,9 @@ export default function Home() {
                             step="0.1"
                             value={Number((bucket.p * 100).toFixed(2))}
                             onChange={(e) => {
-                              const next = [...buckets];
+                              const next = [...activeBuckets];
                               next[idx] = { ...bucket, p: parseNumber(e.target.value) / 100 };
-                              setBuckets(next);
+                              setActiveBuckets(next);
                             }}
                           />
                           <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-[color:var(--muted)]">
@@ -1439,46 +1130,46 @@ export default function Home() {
                         {bucket.type === "uniform" ? (
                           <>
                             <label className="flex flex-col gap-1">
-                              Min R
+                              Min {unitSuffix}
                               <input
                                 className="rounded-lg border border-black/10 bg-transparent px-2 py-1"
                                 type="number"
                                 step="0.1"
                                 value={bucket.lo ?? 0}
                                 onChange={(e) => {
-                                  const next = [...buckets];
+                                  const next = [...activeBuckets];
                                   next[idx] = { ...bucket, lo: parseNumber(e.target.value) };
-                                  setBuckets(next);
+                                  setActiveBuckets(next);
                                 }}
                               />
                             </label>
                             <label className="flex flex-col gap-1">
-                              Max R
+                              Max {unitSuffix}
                               <input
                                 className="rounded-lg border border-black/10 bg-transparent px-2 py-1"
                                 type="number"
                                 step="0.1"
                                 value={bucket.hi ?? 0}
                                 onChange={(e) => {
-                                  const next = [...buckets];
+                                  const next = [...activeBuckets];
                                   next[idx] = { ...bucket, hi: parseNumber(e.target.value) };
-                                  setBuckets(next);
+                                  setActiveBuckets(next);
                                 }}
                               />
                             </label>
                           </>
                         ) : (
                           <label className="flex flex-col gap-1">
-                            R
+                            {isPercent ? "Value %" : "R"}
                             <input
                               className="rounded-lg border border-black/10 bg-transparent px-2 py-1"
                               type="number"
                               step="0.1"
                               value={bucket.v ?? 0}
                               onChange={(e) => {
-                                const next = [...buckets];
+                                const next = [...activeBuckets];
                                 next[idx] = { ...bucket, v: parseNumber(e.target.value) };
-                                setBuckets(next);
+                                setActiveBuckets(next);
                               }}
                             />
                           </label>
@@ -1495,7 +1186,9 @@ export default function Home() {
                 <div>
                   <h3 className="text-base font-semibold">Progressive exposure</h3>
                   <p className="text-xs text-[color:var(--muted)]">
-                    Adjust risk based on streaks. Loss streak halves risk, win streak doubles it.
+                    {isPercent
+                      ? "Scale position size based on streaks. Loss streak halves size, win streak doubles it (1× = outcomes as entered)."
+                      : "Adjust risk based on streaks. Loss streak halves risk, win streak doubles it."}
                   </p>
                 </div>
                 <label className="flex items-center gap-2 text-sm font-medium">
@@ -1531,34 +1224,42 @@ export default function Home() {
                     />
                   </label>
                   <label className="flex flex-col gap-2 text-sm font-medium">
-                    Min risk
+                    {isPercent ? "Min size" : "Min risk"}
                     <div className="relative">
                       <input
                         className="w-full rounded-xl border border-black/10 bg-transparent py-2 pl-3 pr-8 text-base"
                         type="number"
                         step="0.01"
                         min={0}
-                        value={minRiskPercent}
-                        onChange={(e) => setMinRiskPercent(parseNumber(e.target.value))}
+                        value={isPercent ? minSizeMultiple : minRiskPercent}
+                        onChange={(e) =>
+                          (isPercent ? setMinSizeMultiple : setMinRiskPercent)(
+                            parseNumber(e.target.value)
+                          )
+                        }
                       />
                       <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-[color:var(--muted)]">
-                        %
+                        {isPercent ? "×" : "%"}
                       </span>
                     </div>
                   </label>
                   <label className="flex flex-col gap-2 text-sm font-medium">
-                    Max risk
+                    {isPercent ? "Max size" : "Max risk"}
                     <div className="relative">
                       <input
                         className="w-full rounded-xl border border-black/10 bg-transparent py-2 pl-3 pr-8 text-base"
                         type="number"
                         step="0.01"
                         min={0}
-                        value={maxRiskPercent}
-                        onChange={(e) => setMaxRiskPercent(parseNumber(e.target.value))}
+                        value={isPercent ? maxSizeMultiple : maxRiskPercent}
+                        onChange={(e) =>
+                          (isPercent ? setMaxSizeMultiple : setMaxRiskPercent)(
+                            parseNumber(e.target.value)
+                          )
+                        }
                       />
                       <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-[color:var(--muted)]">
-                        %
+                        {isPercent ? "×" : "%"}
                       </span>
                     </div>
                   </label>
@@ -1584,12 +1285,12 @@ export default function Home() {
                   <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.2em] text-[color:var(--muted)]">
                     <span className="rounded-full border border-black/10 px-2 py-1">
                       {results
-                        ? `${results.equityPaths.length.toLocaleString()} paths`
+                        ? `${results.nPaths.toLocaleString()} paths`
                         : "0 paths"}
                     </span>
                     <span className="rounded-full border border-black/10 px-2 py-1">
                       {results
-                        ? `${(results.equityPaths[0]?.length ?? 0).toLocaleString()} trades`
+                        ? `${results.nTrades.toLocaleString()} trades`
                         : "0 trades"}
                     </span>
                   </div>
@@ -1609,7 +1310,7 @@ export default function Home() {
                           className="w-16 rounded-lg border border-black/10 bg-transparent px-2 py-1 text-xs"
                           type="number"
                           min={1}
-                          max={results.equityPaths.length}
+                          max={results.nPaths}
                           value={selectedPathIndex}
                           onChange={(e) => setSelectedPathIndex(parseNumber(e.target.value))}
                         />
@@ -1624,12 +1325,12 @@ export default function Home() {
                       Payoff Buckets
                     </p>
                     <div className="mt-3 grid gap-2 text-xs">
-                      {buckets.map((bucket) => (
+                      {activeBuckets.map((bucket) => (
                         <div key={bucket.id} className="flex items-center justify-between gap-2">
                           <span className="truncate text-[color:var(--muted)]">
                             {bucket.type === "point"
-                              ? `${bucket.name} (${bucket.v}R)`
-                              : `${bucket.name} (${bucket.lo}R to ${bucket.hi}R)`}
+                              ? `${bucket.name} (${bucket.v}${unitSuffix})`
+                              : `${bucket.name} (${bucket.lo}${unitSuffix} to ${bucket.hi}${unitSuffix})`}
                           </span>
                           <span className="mono text-[color:var(--panel-ink)]">
                             {(bucket.p * 100).toFixed(1)}%
@@ -1721,45 +1422,8 @@ export default function Home() {
               <div className="flex items-center justify-between">
                 <h3 className="text-lg font-semibold">Metrics</h3>
               </div>
-              {percentilePathMetrics ? (
-                <div className="mt-4 overflow-x-auto">
-                  <table className="w-full border-collapse border border-white/20 text-xs">
-                    <thead className="text-center uppercase tracking-[0.2em] text-[color:var(--muted)]">
-                      <tr>
-                        <th className="border border-white/20 px-2 py-2">Pct</th>
-                        <th className="border border-white/20 px-2 py-2">Total Ret (Ann)</th>
-                        <th className="border border-white/20 px-2 py-2">Max DD</th>
-                        <th className="border border-white/20 px-2 py-2">Std Dev</th>
-                        <th className="border border-white/20 px-2 py-2">Sharpe (Ann)</th>
-                        <th className="border border-white/20 px-2 py-2">Calmar (Ann)</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {percentilePathMetrics.map((metric) => (
-                        <tr key={metric.label}>
-                          <td className="border border-white/20 px-2 py-2 text-center font-semibold">
-                            {metric.label}
-                          </td>
-                          <td className="border border-white/20 px-2 py-2 text-center">
-                            {percentFormatter.format(metric.totalReturn)}
-                          </td>
-                          <td className="border border-white/20 px-2 py-2 text-center">
-                            {percentFormatter.format(metric.maxDrawdown)}
-                          </td>
-                          <td className="border border-white/20 px-2 py-2 text-center">
-                            {percentFormatter.format(metric.stdDev)}
-                          </td>
-                          <td className="border border-white/20 px-2 py-2 text-center">
-                            {metric.sharpe.toFixed(2)}
-                          </td>
-                          <td className="border border-white/20 px-2 py-2 text-center">
-                            {metric.calmar.toFixed(2)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+              {results ? (
+                <MetricsTable metrics={results.metrics} />
               ) : (
                 <p className="mt-3 text-xs text-[color:var(--muted)]">
                   Run the simulation to see metrics for each percentile path.
@@ -1768,11 +1432,23 @@ export default function Home() {
             </div>
             </div>
 
-            {results && (
+            {results && monthlyReturnRange && (
               <div className="grid gap-6 lg:grid-cols-3">
-                <MonthlyTableView title="Median Path" rows={results.monthlyTables.median} />
-                <MonthlyTableView title="95% Chance Path" rows={results.monthlyTables.p5} />
-                <MonthlyTableView title="5% Chance Path" rows={results.monthlyTables.p95} />
+                <MonthlyReturnsChart
+                  title="Median Path"
+                  rows={results.monthlyTables.median}
+                  yRange={monthlyReturnRange}
+                />
+                <MonthlyReturnsChart
+                  title="95% Chance Path"
+                  rows={results.monthlyTables.p5}
+                  yRange={monthlyReturnRange}
+                />
+                <MonthlyReturnsChart
+                  title="5% Chance Path"
+                  rows={results.monthlyTables.p95}
+                  yRange={monthlyReturnRange}
+                />
               </div>
             )}
 
